@@ -1,0 +1,955 @@
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#include <curand_kernel.h>
+#include <curand.h>
+
+#include <chrono>
+#include <stdio.h>
+#include <stdlib.h>
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <string>
+#include <vector>
+//
+#include <Eigen/Core>
+#include <pcl/visualization/cloud_viewer.h>
+#include <pcl/io/io.h>
+#include <pcl/io/pcd_io.h>
+#include <boost/filesystem.hpp>
+#include <boost/range/iterator_range.hpp>
+#include <pcl/point_types.h>
+#include <pcl/range_image/range_image.h>
+#include <pcl/visualization/range_image_visualizer.h>
+#include <sstream>
+
+const std::string PCD_EXTENSION = ".pcd";
+const std::string BIN_EXTENSION = ".bin";
+const std::string TXT_EXTENSION = ".txt";
+const std::string CALIB_SUFFIX = "calib";
+const std::string VELODYNE_PATH = "KITTI\\velodyne\\";
+const std::string VELODYNE_PCD_PATH = "KITTI\\velodyne_pcd\\";
+const std::string LABEL_PATH = "KITTI\\labels\\";
+const std::string CALIB_PATH = "KITTI\\calib\\";
+
+const int RANSAC_MODELS = 1000;
+
+const float X_MIN = 5.0;
+const float X_MAX = 40.4;
+const float X_STEP = 0.16;
+
+const float Y_MIN = -20.0;
+const float Y_MAX = 20.0;
+const float Y_STEP = 0.16;
+
+const float Z_MIN = -2.0;
+const float Z_MAX = 1.0;
+
+const int POINTS_PER_PILLAR = 450;
+const int MIN_POINTS_PER_PILLAR = 5;
+const float DISTANCE = 0.2;
+const float GROUND_POINT_DISTANCE_THRESHOLD = 0.2;
+
+
+struct Point {
+    float x;
+    float y;
+    float z;
+    float category;
+
+    bool operator==(const Point& p) const
+    {
+        return (x == p.x && y == p.y && z == p.z );
+    }
+};
+
+struct Model {
+    float a;
+    float b;
+    float c;
+};
+
+struct Pillar {
+    int maxX = X_MIN;
+    int maxY = Y_MIN;
+    int maxZ = Z_MIN;
+    int minX = X_MAX;
+    int minY = Y_MAX;
+    int minZ = Z_MAX;
+};
+
+struct PillarSync {
+    Point refPoint;
+    bool finished = false;
+};
+
+class PCObject {
+public:
+    std::string type;
+    float truncated;
+    int occluded;
+    float alpha;
+    float left;
+    float top;
+    float right;
+    float bottom;
+    float height;
+    float width;
+    float length;
+    float x;
+    float y;
+    float z;
+    float rotationY;
+    float score;
+
+    PCObject() {};
+
+    PCObject(std::string typeS, std::string truncatedS, std::string occludedS,
+        std::string alphaS, std::string leftS, std::string topS, std::string rightS,
+        std::string bottomS, std::string heightS, std::string widthS, std::string lengthS,
+        std::string xS, std::string yS, std::string zS, std::string rotationYS) {
+        type = typeS;
+        truncated = stof(truncatedS);
+        occluded = stoi(occludedS);
+        alpha = stoi(alphaS);
+        left = stof(leftS);
+        top = stof(topS);
+        right = stof(rightS);
+        bottom = stof(bottomS);
+        height = stof(heightS);
+        width = stof(widthS);
+        length = stof(lengthS);
+        x = stof(xS);
+        y = stof(yS);
+        z = stof(zS);
+        rotationY = stof(rotationYS);
+    };
+
+    PCObject copyWithUpdatedCentroidAndYaw(Eigen::Matrix<float, 1, 3> centroid, float yaw);
+};
+
+PCObject PCObject::copyWithUpdatedCentroidAndYaw(Eigen::Matrix<float, 1, 3> centroid, float yaw) {
+    PCObject newPcObject;
+    newPcObject.type = this->type;
+    newPcObject.truncated = this->truncated;
+    newPcObject.occluded = this->occluded;
+    newPcObject.alpha = this->alpha;
+    newPcObject.left = this->left;
+    newPcObject.top = this->top;
+    newPcObject.right = this->right;
+    newPcObject.bottom = this->bottom;
+    newPcObject.height = this->height;
+    newPcObject.width = this->width;
+    newPcObject.length = this->length;
+    newPcObject.x = centroid[0];
+    newPcObject.y = centroid[1];
+    newPcObject.z = centroid[2];
+    newPcObject.rotationY = yaw;
+    newPcObject.score = this->score;
+    return newPcObject;
+}
+
+__device__ bool isIndexValid(int index, int pillarsM, int pillarsN) {
+    return (index >= 0 && (index < pillarsM * pillarsN));
+}
+
+__global__ void resetPillars(Pillar* pillars, float X_MIN, float Y_MIN, float Z_MIN, float X_MAX, float Y_MAX, float Z_MAX, int M, int N) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= M * N) {
+        return;
+    }
+    Pillar* p = (pillars+i);
+    p->maxX = X_MIN * 1000;
+    p->maxY = Y_MIN * 1000;
+    p->maxZ = Z_MIN * 1000;
+    p->minX = X_MAX * 1000;
+    p->minY = Y_MAX * 1000;
+    p->minZ = Z_MAX * 1000;
+}
+
+__global__ void resetPoints(Point* points, int M, int N) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= M * N) {
+        return;
+    }
+    (points + i)->x = 0;
+    (points + i)->y = 0;
+    (points + i)->z = 100;
+    (points + i)->category = 0;
+}
+
+__global__ void filterByCoordinatesAndIntensity(Point* points, Point* dst, int* nres, float X_MIN, float X_MAX, float Y_MIN, float Y_MAX, float Z_MIN, float Z_MAX, int nrOfPoints)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= nrOfPoints) {
+        return;
+    }
+    Point p = points[i];
+    if (p.x >= X_MIN && p.x <= X_MAX && p.y >= Y_MIN && p.y <= Y_MAX && p.z >= Z_MIN && p.z <= Z_MAX) {
+        dst[atomicAdd(nres, 1)] = points[i];
+    }
+}
+
+__device__ int myAtomicLimit(int* address, int limit)
+{
+    // Create an initial guess for the value stored at *address.
+    int guess = *address;
+    int a = min(limit, guess+1);
+    int oldValue = atomicCAS(address, guess, a);
+
+    // Loop while the guess is incorrect.
+    while (oldValue != guess)
+    {
+        guess = oldValue;
+        a = min(limit, guess+1);
+        oldValue = atomicCAS(address, guess, a);
+    }
+
+    return oldValue;
+}
+
+__global__ void generateInitialPillars(Point* points, float X_MIN, float X_MAX, float Y_MIN, float Y_MAX, float Z_MIN, float Z_MAX, float distance, int pillarsMSize, int size, Point* pillars, int* pillarsIndices, int pointsPerPillar)
+{
+    int ind = threadIdx.x + blockIdx.x * blockDim.x;
+    for (int i = ind * 32; i < ind * 32 + 32; i++) {
+        if (i < size) {
+            Point p = points[i];
+            if (p.x >= X_MIN && p.x <= X_MAX && p.y >= Y_MIN && p.y <= Y_MAX && p.z >= Z_MIN && p.z <= Z_MAX) {
+                int pillarsM = (p.x - X_MIN) / distance;
+                int pillarsN = (p.y - Y_MIN) / distance;
+                int ind = pillarsMSize * pillarsN + pillarsM;
+                pillars[ind * pointsPerPillar + myAtomicLimit((pillarsIndices + ind), pointsPerPillar - 1)] = p;
+            }
+        }
+    }
+    
+}
+
+__global__ void assignCategoryToPoint(int* pillarsIndicesObstaclePoints, int nrOfPoints, Point* pillars, Point refPoint, Point* refPoints, Pillar* pillar, int ind, int pointsPerPillar, float distance)
+{
+    int pointStartInd = threadIdx.x + blockIdx.x * blockDim.x;
+    refPoints[ind] = refPoint;
+    for (int i = pointStartInd *16; i < pointStartInd*16 + 16; i++) {
+        if (i >= nrOfPoints) {
+            return;
+        }
+
+        Point* p = (pillars + ind  * pointsPerPillar + i);
+        if ((p->z - refPoint.z) < 0.0f || (fabs(p->z - refPoint.z) < distance)) {
+            p->category = 10;
+            refPoints[ind] = (*p);
+        }
+        else {
+            pillars[ind * pointsPerPillar + myAtomicLimit((pillarsIndicesObstaclePoints + ind), pointsPerPillar - 1)] = (*p);
+            atomicMin(&(pillar->minX), (int)(p->x * 1000));
+            atomicMax(&(pillar->maxX), (int)(p->x * 1000));
+            atomicMin(&(pillar->minY), (int)(p->y * 1000));
+            atomicMax(&(pillar->maxY), (int)(p->y * 1000));
+            atomicMin(&(pillar->minZ), (int)(p->z * 1000));
+            atomicMax(&(pillar->maxZ), (int)(p->z * 1000));
+        }
+    }
+}
+
+__global__ void assignCategoryToFirstRowOfPillars(Point* pillars, Point* refPoints, Pillar* pillarsPillars, Point refPoint, int* pillarsIndicesObstaclePoints, int* pillarsIndices, int currentM, int M, int pointsPerPillar, float distance)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int ind = M * i + currentM;
+    refPoints[ind] = refPoint;
+    Pillar* pillar = (pillarsPillars + ind);
+
+    assignCategoryToPoint << < 1, 16 >> > (pillarsIndicesObstaclePoints, pillarsIndices[ind], pillars, refPoint, refPoints, pillar, ind, pointsPerPillar, distance);
+}
+
+__global__ void assignCategoryPerRow(Point* pillars, Point* refPoints, Pillar* pillarsPillars, int* pillarsIndicesObstaclePoints, int* pillarsIndices, int startM, int M, int pointsPerPillar, float distance)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    int ind = M * i + startM;
+    
+    Point currentRefPoint = refPoints[ind-1];
+    refPoints[ind] = currentRefPoint;
+    
+    Pillar* pillar = (pillarsPillars + ind);
+
+    for (int j = 0; j < pillarsIndices[ind]; j++) {
+        Point* p = (pillars + ind * pointsPerPillar + j);
+        if ((p->z - currentRefPoint.z) < 0.0f || (fabs(p->z - currentRefPoint.z) < distance)) {
+            p->category = 10;
+            refPoints[ind] = (*p);
+        }
+        else {
+            pillars[ind * pointsPerPillar + myAtomicLimit((pillarsIndicesObstaclePoints + ind), pointsPerPillar - 1)] = (*p);
+            atomicMin(&(pillar->minX), (int)(p->x * 1000));
+            atomicMax(&(pillar->maxX), (int)(p->x * 1000));
+            atomicMin(&(pillar->minY), (int)(p->y * 1000));
+            atomicMax(&(pillar->maxY), (int)(p->y * 1000));
+            atomicMin(&(pillar->minZ), (int)(p->z * 1000));
+            atomicMax(&(pillar->maxZ), (int)(p->z * 1000));
+        }
+    }
+
+}
+
+__global__ void assignCategory(Point* pillars, Point* refPoints, Pillar* pillarsPillars, int M, int N, float distance, int* pillarsIndicesObstaclePoints, int* pillarsIndices, float X_MIN, float Y_MIN, float groundPointDistanceThreshold)
+{
+    Point refPoint;
+    refPoint.x = X_MIN;
+    refPoint.y = 0;
+    refPoint.z = -1.73f;
+
+    int pillarsM = (refPoint.x - X_MIN) / distance;
+    int pillarsN = (refPoint.y - Y_MIN) / distance;
+    int ind = M * pillarsN + pillarsM;
+    
+    assignCategoryToFirstRowOfPillars <<< 1, N>>>(pillars, refPoints, pillarsPillars, refPoint, pillarsIndicesObstaclePoints, pillarsIndices, pillarsM, M, POINTS_PER_PILLAR, groundPointDistanceThreshold);
+    cudaDeviceSynchronize();
+
+    for (int i = pillarsM+1; i < M; i++) {
+        assignCategoryPerRow << < 1, N >> > (pillars, refPoints, pillarsPillars, pillarsIndicesObstaclePoints, pillarsIndices, i, M, POINTS_PER_PILLAR, groundPointDistanceThreshold);
+        cudaDeviceSynchronize();
+    }
+
+}
+
+__global__ void generatePillars(Pillar* pillarsPillars, Point* points, int* nrOfPoints, float X_MIN, float Y_MIN, float distance, int pillarsMSize, Point* pillars, int* pillarsIndices, int pointsPerPillar)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= (*nrOfPoints)) {
+        return;
+    }
+    Point p = points[i];
+
+    int pillarsM = (p.x - X_MIN) / distance;
+    int pillarsN = (p.y - Y_MIN) / distance;
+    int ind = pillarsMSize * pillarsN + pillarsM;
+    Pillar* pillar = (pillarsPillars+ind);
+        
+    atomicMin(&(pillar->minX), (int)(p.x * 1000));
+    atomicMax(&(pillar->maxX), (int)(p.x * 1000));
+    atomicMin(&(pillar->minY), (int)(p.y * 1000));
+    atomicMax(&(pillar->maxY), (int)(p.y * 1000));
+    atomicMin(&(pillar->minZ), (int)(p.z * 1000));
+    atomicMax(&(pillar->maxZ), (int)(p.z * 1000));
+    pillars[ind * pointsPerPillar + myAtomicLimit((pillarsIndices + ind), pointsPerPillar - 1)] = p;
+}
+
+__global__ void getInliersAndOutliers(int* modelInd, int nrOfPoints, char* pointsModelsMat, Point* inliers, Point* outliers, Point* points, int* inlCnt, int* outCnt) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (i >= nrOfPoints) {
+        return;
+    }
+
+    if (pointsModelsMat[(*modelInd) * nrOfPoints + i] == 1) {
+        inliers[atomicAdd(inlCnt, 1)] = points[i];
+    }
+    else {
+        outliers[atomicAdd(outCnt, 1)] = points[i];
+    }
+}
+
+__global__ void bestModelIndex(int nrOfModels, int* inliersCounters, int* ind, int* max) {
+    int maxTmp = inliersCounters[0];
+    int maxInd = 0;
+    for (int i = 0; i < nrOfModels; i++) {
+        if (maxTmp < inliersCounters[i]) {
+            maxTmp = inliersCounters[i];
+            maxInd = i;
+        }
+    }
+    (*ind) = maxInd;
+    (*max) = maxTmp;
+}
+
+__global__ void generateRansacModels(Point* points, float* models, int nrOfPoints, int nrOfModels) {
+    curandState_t state;
+    int stmp = clock();
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= nrOfModels) {
+        return;
+    }
+    curand_init(i + stmp, 0, 0, &state);
+    Point p1, p2, p3;
+    int index = curand(&state) % nrOfPoints;
+    p1.x = 0;
+    p1.y = 0;
+    p1.z = -1.73;
+    p2 = p1;
+    p3 = p1;
+    while ((p1.x == p2.x && p1.y == p2.y && p1.z == p2.z) ||
+           (p1.x == p3.x && p1.y == p3.y && p1.z == p3.z) ||
+           (p2.x == p3.x && p2.y == p3.y && p2.z == p3.z)) {
+        index = curand(&state) % nrOfPoints;
+        p2 = points[index];
+        index = curand(&state) % nrOfPoints;
+        p3 = points[index];
+    }
+
+    float x1, y1, z1, x2, y2, z2, x3, y3, z3;
+    x1 = p1.x; x2 = p2.x; x3 = p3.x;
+    y1 = p1.y; y2 = p2.y; y3 = p3.y;
+    z1 = p1.z; z2 = p2.z; z3 = p3.z;
+    float a = ((y2 - y1) * (z3 - z1)) - ((z2 - z1) * (y3 - y1));
+    float b = ((z2 - z1) * (x3 - x1)) - ((x2 - x1) * (z3 - z1));
+    float c = ((x2 - x1) * (y3 - y1)) - ((y2 - y1) * (x3 - x1));
+
+    models[i * 6] = a;
+    models[i * 6 + 1] = b;
+    models[i * 6 + 2] = c;
+    models[i * 6 + 3] = x1;
+    models[i * 6 + 4] = y1;
+    models[i * 6 + 5] = z1;
+}
+
+__global__ void ransacUtil(Point* points, float* models, char* pointsModelsMat, int nrOfModels, int nrOfPoints, float distanceThreshold, int* inliersCounters)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (i >= nrOfPoints) {
+        return;
+    }
+
+    Point p = points[i];
+
+    for (int ind = 0; ind < nrOfModels; ind++) {
+        float  b, c, x1, y1, z1, d;
+        float a = models[ind * 6];
+        b = models[ind * 6 + 1];
+        c = models[ind * 6 + 2];
+        x1 = models[ind * 6 + 3];
+        y1 = models[ind * 6 + 4];
+        z1 = models[ind * 6 + 5];
+        d = -(x1 * a + y1 * b + z1 * c);
+        
+
+        float dist = fabs((a * p.x + b * p.y + c * p.z + d)) / sqrt(a * a + b * b + c * c);
+
+        if (dist <= distanceThreshold) {
+            pointsModelsMat[ind * nrOfPoints + i] = 1;
+            atomicAdd((inliersCounters+ind), 1);
+        }
+
+    }
+}
+
+__global__ void initGraph3(int* edges, int* indices, Point* points, int nrOfPoints, int currentPointInd, float distThreshold) {
+    int current = threadIdx.x + blockIdx.x * blockDim.x;
+    if (current > nrOfPoints) {
+        return;
+    }
+    Point p1 = points[current];
+    for (int i = current+1; i < nrOfPoints; i++) {
+        Point p2 = points[i];
+        float dist = sqrt((p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y));// +(p1.z - p2.z) * (p1.z - p2.z));// +((p1.z - p2.z) * (p1.z - p2.z)));// +((p1.y - p2.y) * (p1.y - p2.y)) + ((p1.z - p2.z) * (p1.z - p2.z))); //((p1.x - p2.x) * (p1.x - p2.x))
+        if (dist <= distThreshold) {
+            edges[700 * current + atomicAdd((indices + current), 1)] = i;
+        }
+    }
+}
+
+
+__global__ void pillarBFS5(int* pillarsIndices, int* clusters, int pillarsM, int pillarsN, int pillarInd, int clusterCnt, Pillar* pillarPillar, Pillar* pillarsPillars, int minPointsPerPillar) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int n = pillarInd;
+    if (i == 0) {
+        n -= pillarsM;
+    }
+    else if (i == 1) {
+        n += 1;
+    }
+    else if (i == 2) {
+        n += pillarsM;
+    }
+    else if (i == 3) {
+        n -= 1;
+    }
+    else if (i == 4) {
+        n = n - pillarsM - 1;
+    }
+    else if (i == 5) {
+        n = n - pillarsM + 1;
+    }
+    else if (i == 6) {
+        n = n + pillarsM - 1;
+    }
+    else if (i == 7) {
+        n = n + pillarsM + 1;
+    }
+
+    if (isIndexValid(n, pillarsM, pillarsN) && pillarsIndices[n] > minPointsPerPillar && clusters[n] == -1) {
+        Pillar* currentPillar = (pillarsPillars + n);
+        atomicMin(&(pillarPillar->minX), (int)(currentPillar->minX));
+        atomicMax(&(pillarPillar->maxX), (int)(currentPillar->maxX));
+        atomicMin(&(pillarPillar->minY), (int)(currentPillar->minY));
+        atomicMax(&(pillarPillar->maxY), (int)(currentPillar->maxY));
+        atomicMin(&(pillarPillar->minZ), (int)(currentPillar->minZ));
+        atomicMax(&(pillarPillar->maxZ), (int)(currentPillar->maxZ));
+        
+        
+        clusters[n] = clusterCnt;
+        pillarBFS5 << <1, 8 >> > (pillarsIndices, clusters, pillarsM, pillarsN, n, clusterCnt, pillarPillar, pillarsPillars, minPointsPerPillar);
+    }
+
+}
+
+__global__ void generateClusters2(Pillar* bboxes, Pillar* pillarsPillars, int* pillarsIndices, int* clusters, int* clusterCnt, int pillarsM, int pillarsN, int minPointsPerPillar)
+{
+    for (int i = 0; i < pillarsM * pillarsN; i++) {
+        int nrOfPoints = pillarsIndices[i];
+        if (nrOfPoints <= minPointsPerPillar || clusters[i] != -1) {
+            continue;
+        }
+        Pillar* bbox = (bboxes + (*clusterCnt));
+
+        Pillar* currentPillar = (pillarsPillars + i);
+        atomicMin(&(bbox->minX), (int)(currentPillar->minX));
+        atomicMax(&(bbox->maxX), (int)(currentPillar->maxX));
+        atomicMin(&(bbox->minY), (int)(currentPillar->minY));
+        atomicMax(&(bbox->maxY), (int)(currentPillar->maxY));
+        atomicMin(&(bbox->minZ), (int)(currentPillar->minZ));
+        atomicMax(&(bbox->maxZ), (int)(currentPillar->maxZ));
+
+        clusters[i] = (*clusterCnt);
+
+        pillarBFS5 << <1, 8 >> > (pillarsIndices, clusters, pillarsM, pillarsN, i, (*clusterCnt), bbox, pillarsPillars, minPointsPerPillar);
+        cudaDeviceSynchronize();
+        (*clusterCnt)++;
+    }
+}
+
+std::vector<float> readCalibrationParams(std::string filename) {
+    std::ifstream input(CALIB_PATH + filename + TXT_EXTENSION);
+    if (!input.good()) {
+        std::cerr << "Could not read calib file: " << filename + CALIB_SUFFIX + TXT_EXTENSION << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    std::string line;
+    int cntr = 0;
+    std::string v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12;
+    while (getline(input, line)) {
+        cntr++;
+        if (cntr != 6) continue;
+        std::stringstream ss(line);
+        std::string s;
+        ss >> s >> v1 >> v2 >> v3 >> v4 >> v5 >> v6 >> v7 >> v8 >> v9 >> v10 >> v11 >> v12;
+    }
+    return std::vector<float>{stof(v1), stof(v2), stof(v3), stof(v4),
+        stof(v5), stof(v6), stof(v7), stof(v8),
+        stof(v9), stof(v10), stof(v11), stof(v12)};
+}
+
+std::vector<PCObject> transformLabelsToLidarCoordinates(std::vector<PCObject> pcObjects, Eigen::Matrix<float, 3, 3> rotationMatrix, Eigen::Matrix<float, 1, 3> translationMatrix) {
+    std::vector<PCObject> transformedPcObjects;
+    for (PCObject pcObject : pcObjects) {
+        Eigen::Matrix<float, 1, 3> centroid = { pcObject.x, pcObject.y, pcObject.z };
+        Eigen::Matrix<float, 3, 3> t = rotationMatrix.inverse().transpose();
+        centroid = centroid * rotationMatrix.inverse().transpose() - translationMatrix;
+        float yaw = pcObject.rotationY - 3.14 / 2;
+        while (yaw < -M_PI) {
+            yaw += (M_PI * 2);
+        }
+        while (yaw > M_PI) {
+            yaw -= (M_PI * 2);
+        }
+
+        if (centroid[0] - pcObject.length > X_MIN && centroid[0] + pcObject.length < X_MAX && centroid[1] - pcObject.width > Y_MIN && centroid[1] + pcObject.width < Y_MAX) {
+            transformedPcObjects.push_back(pcObject.copyWithUpdatedCentroidAndYaw(centroid, yaw));
+        }
+
+    }
+    return transformedPcObjects;
+}
+
+std::vector<PCObject> readLabels(std::string filename) {
+    std::ifstream input(LABEL_PATH + filename + TXT_EXTENSION);
+    if (!input.good()) {
+        std::cerr << "Could not read labels file: " << filename + TXT_EXTENSION << endl;
+        exit(EXIT_FAILURE);
+    }
+    std::vector<PCObject> pcObjects;
+    std::string line;
+    while (getline(input, line)) {
+        std::stringstream ss(line);
+        std::string type;
+        ss >> type;
+        //if (!isValidType(type)) continue;
+        std::string val, occluded, truncated, alpha, left, top, right, bottom, height, width, length, x, y, z, rotationY, score;
+        ss >> truncated >> occluded >> alpha >> left >> top >> right >> bottom >> height >> width >> length >> x >> y >> z >> rotationY;
+        PCObject pcObject(type, truncated, occluded, alpha, left, top, right, bottom, height, width, length, x, y, z, rotationY);
+        pcObjects.push_back(pcObject);
+    }
+    return pcObjects;
+}
+
+void computeScore(std::string filename, Pillar bboxes[], int nrOfBboxes, int *score, int *totalKittiBoxes) {
+    std::vector<PCObject> pcObjects = readLabels(filename);
+    std::vector<float> calibrationParams = readCalibrationParams(filename);
+    Eigen::Matrix<float, 3, 3> rotationMatrix = (Eigen::Matrix<float, 3, 3>() << calibrationParams[0], calibrationParams[1], calibrationParams[2],
+        calibrationParams[4], calibrationParams[5], calibrationParams[6],
+        calibrationParams[8], calibrationParams[9], calibrationParams[10]).finished();
+    Eigen::Matrix<float, 1, 3> translationMatrix = (Eigen::Matrix<float, 1, 3>() << calibrationParams[3], calibrationParams[7], calibrationParams[11]).finished();;
+    std::vector<PCObject> transformedPcObjects = transformLabelsToLidarCoordinates(pcObjects, rotationMatrix, translationMatrix);
+   
+    for (int i = 0; i < transformedPcObjects.size(); i++) {
+        int x_min = transformedPcObjects.at(i).x - transformedPcObjects.at(i).length/2;
+        int x_max = transformedPcObjects.at(i).x + transformedPcObjects.at(i).length/2;
+        int y_min = transformedPcObjects.at(i).y - transformedPcObjects.at(i).width/2;
+        int y_max = transformedPcObjects.at(i).y + transformedPcObjects.at(i).width/2;
+        (*totalKittiBoxes)++;
+        for (int j = 0; j < nrOfBboxes; j++) {
+            int xCenter = (bboxes[j].minX + ((bboxes[j].maxX - bboxes[j].minX) / 2)) / 1000.0;
+            int yCenter = (bboxes[j].minY + ((bboxes[j].maxY - bboxes[j].minY) / 2)) / 1000.0;
+
+            if(xCenter >= x_min && xCenter <= x_max && yCenter >= y_min && yCenter <= y_max) {
+                (*score)++;
+                break;
+            }
+            if ((transformedPcObjects.at(i).x >= bboxes[j].minX && transformedPcObjects.at(i).x <= bboxes[j].maxX &&
+                transformedPcObjects.at(i).y >= bboxes[j].minY && transformedPcObjects.at(i).y <= bboxes[j].maxY) ||
+                (transformedPcObjects.at(i).x < bboxes[j].minX && transformedPcObjects.at(i).x > bboxes[j].maxX &&
+                 transformedPcObjects.at(i).y < bboxes[j].minY && transformedPcObjects.at(i).y > bboxes[j].maxY)) {
+                (*score)++;
+                break;
+            }
+        }
+    }
+}
+
+void drawBoundingBoxes(std::string filename, pcl::visualization::PCLVisualizer::Ptr viewer) {
+    std::vector<PCObject> pcObjects = readLabels(filename);
+    std::vector<float> calibrationParams = readCalibrationParams(filename);
+    Eigen::Matrix<float, 3, 3> rotationMatrix = (Eigen::Matrix<float, 3, 3>() << calibrationParams[0], calibrationParams[1], calibrationParams[2],
+        calibrationParams[4], calibrationParams[5], calibrationParams[6],
+        calibrationParams[8], calibrationParams[9], calibrationParams[10]).finished();
+    Eigen::Matrix<float, 1, 3> translationMatrix = (Eigen::Matrix<float, 1, 3>() << calibrationParams[3], calibrationParams[7], calibrationParams[11]).finished();;
+    std::vector<PCObject> transformedPcObjects = transformLabelsToLidarCoordinates(pcObjects, rotationMatrix, translationMatrix);
+    int boxCntr = 0;
+    for (PCObject pcObject : transformedPcObjects) {
+        Eigen::Vector3f translationMat(pcObject.x, pcObject.y, pcObject.z);
+        Eigen::Quaternionf rotation;
+
+        viewer->addCube(translationMat, Eigen::Quaternion<float>(Eigen::AngleAxis<float>(sin(pcObject.rotationY), Eigen::Vector3f::UnitZ())), pcObject.length, pcObject.width, pcObject.height, "boundingBox" + boxCntr, 0);
+        //viewer->addCube(pcObject.left, pcObject.right, pcObject.top, pcObject.bottom, 0.0, 10.0, 255.0, 0.0, 0.0, "boundingBox" + boxCntr, 0);
+        viewer->setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, 0.7, "boundingBox" + boxCntr);
+        boxCntr++;
+    }
+}
+
+void clearConsole()
+{
+#if defined _WIN32
+    system("cls");
+#elif defined (__LINUX__) || defined(__gnu_linux__) || defined(__linux__)
+    system("clear");
+#elif defined (__APPLE__)
+    system("clear");
+#endif
+}
+
+int main()
+{
+    srand(time(NULL));
+
+    bool withRansac = true;
+    bool displayGeneratedBoundingBoxes = false;
+    bool displayClusters = true;
+    bool displayBoundingBoxes = true;
+    bool measurePerformanceDetailed = false;
+    bool measurePerformance = false;
+    bool computeScoreEnabled = false;
+    bool end = false;
+    int score = 0;
+    int kittiScore = 0;
+
+
+    Point* d_points = 0;
+    Point* d_dst = 0, * pillars = 0, * h_pillars = 0, *refPoints = 0, *h_refPoints;
+    Point* inliers, * outliers, * h_inliers, * h_outliers;
+    Pillar* pillarsPillars = 0, *h_pillarsPillars = 0, *bboxes = 0, * h_bboxes = 0;
+    float intensity = 1.0f;
+    int *nres = 0, *h_res = 0;
+    int M = (X_MAX - X_MIN) / DISTANCE;
+    int N = (Y_MAX - Y_MIN) / DISTANCE;
+    int* clusters = 0, * h_clusters = 0, * edges = 0, * h_edges = 0, * h_pillarsIndices = 0, * pillarsIndices = 0, * pillarsIndicesObstaclePoints = 0 , * indices = 0, * h_indices = 0, * ind = 0, * clustersCnt = 0, * h_clustersCnt = 0, * h_outCnt = 0, * h_inlCnt = 0;
+    char* d_pointsModelsMat = 0, * h_pointsModelsMat = 0;
+    float* d_models = 0, * h_models = 0;
+    int* d_inliersCounters = 0;
+    int* d_maxInd = 0, * d_max = 0;
+    int* inlCnt = 0, * outCnt = 0;
+    int* pillarCnt = 0, *nextPillarIndices = 0;
+
+    int maxSize = 200000;
+    cudaError_t cudaStatus;
+    cudaStatus = cudaMalloc((void**)&d_points, maxSize * sizeof(Point));
+    cudaStatus = cudaMalloc((void**)&d_dst, maxSize * sizeof(Point));
+    cudaStatus = cudaMalloc((void**)&nres, 1 * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&pillarCnt, 1 * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&nextPillarIndices, M * N * sizeof(int));
+    cudaMemset(nres, 0, 1 * sizeof(int));
+
+        cudaStatus = cudaMalloc((void**)&d_pointsModelsMat, RANSAC_MODELS * (maxSize / 512) * 512 * sizeof(char));
+       
+        cudaStatus = cudaMalloc((void**)&d_models, RANSAC_MODELS * 6 * sizeof(float));
+        h_models = (float*)malloc(RANSAC_MODELS * 6 * sizeof(float));
+        
+        cudaStatus = cudaMalloc((void**)&d_inliersCounters, RANSAC_MODELS * sizeof(int));
+        cudaMemset(d_inliersCounters, 0, RANSAC_MODELS * sizeof(int));
+        
+        cudaStatus = cudaMalloc((void**)&d_maxInd, 1 * sizeof(int));
+        cudaStatus = cudaMalloc((void**)&d_max, 1 * sizeof(int));
+        cudaStatus = cudaMalloc((void**)&inliers, maxSize * sizeof(Point));
+        cudaStatus = cudaMalloc((void**)&outliers, maxSize * sizeof(Point));
+        cudaStatus = cudaMalloc((void**)&inlCnt, 1 * sizeof(int));
+        cudaStatus = cudaMalloc((void**)&outCnt, 1 * sizeof(int));
+        cudaMemset(inlCnt, 0, 1 * sizeof(int));
+        cudaMemset(outCnt, 0, 1 * sizeof(int));
+        h_outliers = (Point*)malloc(maxSize/2 * sizeof(Point));
+        h_inliers = (Point*)malloc(maxSize/2 * sizeof(Point));
+
+    cudaStatus = cudaMalloc((void**)&ind, 1 * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&clustersCnt, 1 * sizeof(int));
+    cudaMemset(ind, 0, 1 * sizeof(int));
+    cudaMemset(clustersCnt, 0, 1 * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&indices, ((maxSize / 512 * 512) + 1) * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&pillars, (M * N + POINTS_PER_PILLAR) * POINTS_PER_PILLAR * sizeof(Point));
+    cudaStatus = cudaMalloc((void**)&pillarsIndices, M * N * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&pillarsIndicesObstaclePoints, M * N * sizeof(int));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+    }
+    h_indices = (int*)malloc(maxSize * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&clusters, (maxSize / 512 * 512) * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&pillarsPillars, M * N * sizeof(Pillar));
+    cudaStatus = cudaMalloc((void**)&bboxes, 500 * sizeof(Pillar));
+    
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+    }
+    cudaStatus = cudaMallocHost((void**)&h_clusters, (maxSize / 512 * 512) * sizeof(int));
+    cudaMemset(clusters, -1, (maxSize / 512 * 512) * sizeof(int));
+
+    Point* h_points = 0, * h_dst = 0;// [50000 * 4] ;
+    h_points = (Point*)malloc(maxSize * sizeof(Point));
+    h_clustersCnt = (int*)malloc(1 * sizeof(int));
+    h_outCnt = (int*)malloc(1 * sizeof(int));
+    h_inlCnt = (int*)malloc(1 * sizeof(int));
+    h_res = (int*)malloc(1 * sizeof(int));
+    h_pillars = (Point*)malloc((M * N + POINTS_PER_PILLAR) * POINTS_PER_PILLAR * sizeof(Point));
+    h_pillarsIndices = (int*)malloc(M * N * sizeof(int));
+    h_pillarsPillars = (Pillar*)malloc(M * N * sizeof(Pillar));
+    h_bboxes = (Pillar*)malloc(500 * sizeof(Pillar));
+    int sampleCnt = 0;
+    std::ofstream timeOutput("times.txt");
+
+    while (true) {
+        score = 0;
+        kittiScore = 0;
+        int input = -1;
+
+        std::cout << "(1) Measure total performance\n(2) Don't measure performance\nChoose an option from above: ";
+        std::cin >> input;
+        if (input == 1) {
+            measurePerformance = true;
+        }
+        else {
+            measurePerformance = false;
+        }
+
+        std::cout << "Display clusters (1-yes, 0-no): ";
+        std::cin >> input;
+        if (input == 1) {
+            displayClusters = true;
+        }
+        else {
+            displayClusters = false;
+        }
+
+        std::cout << "Compute score (1-yes, 0-no): ";
+        std::cin >> input;
+        if (input == 1) {
+            computeScoreEnabled = true;
+        }
+        else {
+            computeScoreEnabled = false;
+        }
+
+        for (int pointCloudNumber = 1; pointCloudNumber < 999; pointCloudNumber++) {
+            char tst[10];
+            sprintf(tst, "%06d", pointCloudNumber);
+            std::string s = tst;
+            std::fstream input(VELODYNE_PATH + s + BIN_EXTENSION, std::ios::in | std::ios::binary);
+            if (!input.good()) {
+                std::cerr << "Could not read file: " << VELODYNE_PATH + s + BIN_EXTENSION << std::endl;
+                exit(EXIT_FAILURE);
+            }
+
+            int pointsCounter = 0;
+            for (pointsCounter = 0; input.good() && !input.eof(); pointsCounter++) {
+                Point p;
+                input.read((char*)&p.x, sizeof(float));
+                input.read((char*)&p.y, sizeof(float));
+                input.read((char*)&p.z, sizeof(float));
+                input.read((char*)&p.category, sizeof(float));
+                p.category = 1.0f;
+                h_points[pointsCounter] = p;
+            }
+
+            input.close();
+            int size = pointsCounter;
+
+            std::chrono::steady_clock::time_point start, end;
+            double time_taken;
+
+            cudaStatus = cudaGetLastError();
+
+            if (measurePerformance) {
+                start = std::chrono::high_resolution_clock::now();
+            }
+
+            cudaMemset(pillarsIndices, 0, M * N * sizeof(int));
+            cudaMemset(pillarsIndicesObstaclePoints, 0, M * N * sizeof(int));
+            cudaMemset(clusters, -1, (maxSize / 512 * 512) * sizeof(int));
+
+            cudaMemcpy(d_points, h_points, size * sizeof(Point), cudaMemcpyHostToDevice);
+
+            resetPillars << < (M * N) / 512 + 1, 512 >> > (pillarsPillars, X_MIN, Y_MIN, Z_MIN, X_MAX, Y_MAX, Z_MAX, M, N);
+            resetPillars << < 1, 500 >> > (bboxes, X_MIN, Y_MIN, Z_MIN, X_MAX, Y_MAX, Z_MAX, 100, 5);
+
+            cudaMemset(nres, 0, 1 * sizeof(int));
+
+            cudaMemset(d_inliersCounters, 0, RANSAC_MODELS * sizeof(int));
+            cudaMemset(d_pointsModelsMat, 0, RANSAC_MODELS * (size / 512) * 512 * sizeof(char));
+
+            cudaMemset(outCnt, 0, 1 * sizeof(int));
+            cudaMemset(inlCnt, 0, 1 * sizeof(int));
+
+            filterByCoordinatesAndIntensity << <size / 512 + 1, 512 >> > (d_points, d_dst, nres, X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX, size);
+            
+
+            cudaMemcpy(h_res, nres, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+            size = (*h_res);
+
+            generateRansacModels << <RANSAC_MODELS / 512 + 1, 512 >> > (d_dst, d_models, size, RANSAC_MODELS);
+
+            ransacUtil << <size / 512 + 1, 512 >> > (d_dst, d_models, d_pointsModelsMat, RANSAC_MODELS, size, 0.2, d_inliersCounters);
+
+            bestModelIndex << <1, 1 >> > (RANSAC_MODELS, d_inliersCounters, d_maxInd, d_max);
+
+            getInliersAndOutliers << <size / 512 + 1, 512 >> > (d_maxInd, size, d_pointsModelsMat, inliers, outliers, d_dst, inlCnt, outCnt);
+
+            cudaMemcpy(h_outCnt, outCnt, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_inlCnt, inlCnt, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+            //std::cout << (*h_inlCnt) << std::endl;
+
+            generatePillars << <(*h_outCnt) / 512 + 1, 512 >> > (pillarsPillars, outliers, outCnt, X_MIN, Y_MIN, DISTANCE, M, pillars, pillarsIndices, POINTS_PER_PILLAR);
+
+            cudaMemset(clustersCnt, 0, 1 * sizeof(int));
+                //generateClusters1 << <1, 1 >> > (bboxes, pillarsPillars, pillarsIndices, clusters, clustersCnt, M, N, MIN_POINTS_PER_PILLAR);
+            generateClusters2 << <1, 1 >> > (bboxes, pillarsPillars, pillarsIndices, clusters, clustersCnt, M, N, MIN_POINTS_PER_PILLAR);
+
+            cudaMemcpy(h_bboxes, bboxes, 500 * sizeof(Pillar), cudaMemcpyDeviceToHost);
+            
+
+            if (measurePerformance) {
+                cudaDeviceSynchronize();
+                end = std::chrono::high_resolution_clock::now();
+                time_taken =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                time_taken *= 1e-6;
+                std::cout << "Total : " << std::fixed
+                    << time_taken << std::setprecision(9);
+                std::cout << " ms" << std::endl;
+            }
+
+            timeOutput << sampleCnt << " " << time_taken << std::endl;
+            sampleCnt++;
+
+            cudaMemcpy(h_clustersCnt, clustersCnt, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+            std::cout << (*h_clustersCnt) << std::endl;
+
+            if (displayClusters) {
+
+                pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
+
+
+                    cudaMemcpy(h_clustersCnt, clustersCnt, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_clusters, clusters, M * N * sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_outliers, outliers, (*h_outCnt) * sizeof(Point), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_inliers, inliers, (*h_inlCnt) * sizeof(Point), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_pillarsIndices, pillarsIndices, M * N * sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_pillars, pillars, M * N * POINTS_PER_PILLAR * sizeof(Point), cudaMemcpyDeviceToHost);
+
+                    for (int j = 0; j < (*h_clustersCnt); j++) {
+                        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
+                        for (int i = 0; i < M * N; i++) {
+                            int clusterInd = h_clusters[i];
+                            if (clusterInd != j) {
+                                continue;
+                            }
+                            if (h_pillarsIndices[i] >= POINTS_PER_PILLAR) {
+                                std::cout << "PESTE" << std::endl;
+                            }
+                            for (int k = 0; k < h_pillarsIndices[i]; k++) {
+                                Point p = h_pillars[i * POINTS_PER_PILLAR + k];
+                                pcl::PointXYZI pclPoint = pcl::PointXYZI(p.x, p.y, p.z, 1.0f);
+                                cloud->push_back(pclPoint);
+                            }
+                        }
+                        float R = rand() % 256;// / 255.0;
+                        float G = rand() % 256;// / 255.0;
+                        float B = rand() % 256;// / 255.0;
+                        
+                        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZI> single_color(cloud, R, G, B);
+                        viewer->addPointCloud<pcl::PointXYZI>(cloud, single_color, std::to_string(j));
+                        viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, std::to_string(j));
+                    }
+
+                
+
+                cudaMemcpy(h_clustersCnt, clustersCnt, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+
+
+                viewer->setBackgroundColor(0, 0, 0);
+                viewer->addCoordinateSystem(1.0);
+                viewer->initCameraParameters();
+                while (!viewer->wasStopped())
+                {
+                    viewer->spinOnce(100);
+                }
+                viewer->removeAllPointClouds();
+                viewer->removeAllShapes();
+                viewer->removeAllCoordinateSystems();
+                viewer->close();
+            }
+
+            computeScore(s, h_bboxes, 500, &score, &kittiScore);
+        }
+
+        if (computeScoreEnabled) {
+            cudaMemcpy(h_bboxes, bboxes, 500 * sizeof(Pillar), cudaMemcpyDeviceToHost);
+            std::cout << "KITTI clusters found: " << score << std::endl;
+            std::cout << "Total KITTI clusters: " << kittiScore << std::endl;
+        }
+        timeOutput.close();
+        std::cout << "\n\n\n";
+
+        std::cout << "Run again (1-yes, 0-no): ";
+        std::cin >> input;
+        if (input != 1) {
+            end = true;
+        }
+        else {
+            clearConsole();
+        }
+
+        if (end) {
+            break;
+        }
+    }
+
+    return 0;
+}
